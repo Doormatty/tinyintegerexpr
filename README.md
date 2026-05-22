@@ -1,261 +1,195 @@
 # TinyIntegerExpr
 
-TinyIntegerExpr is a very small recursive descent parser and evaluation engine for
- _**integer**_ math expressions. It's handy when you want to add the ability to evaluate
-_**integer**_ math expressions at runtime without adding a bunch of cruft to your project.
-
-In addition to the standard math operators and precedence, TinyIntegerExpr also supports
-the standard C math functions and runtime binding of variables.
+TinyIntegerExpr is a small integer-only recursive descent parser and evaluator.
+It is intended for C, C++, embedded projects, and Arduino-style builds that need
+runtime integer expressions without floating-point math.
 
 ## Features
 
-- **C99 with no dependencies**.
+- C99 core with a C++17-clean header/source.
 - Single source file and header file.
-- Simple and fast.
-- Implements standard operators precedence.
-- Can add custom functions and variables easily.
-- Can bind variables at eval-time.
-- Released under the zlib license - free for nearly any use.
-- Easy to use and integrate with your code
-- Thread-safe, provided that your *malloc* is.
+- Integer arithmetic, bitwise operators, shifts, variables, and custom functions.
+- Explicit parse/runtime status reporting; no NaN sentinel values.
+- Safe built-in integer operators: divide-by-zero, modulo-by-zero, bad shifts,
+  and signed overflow are reported instead of invoking undefined behavior.
+- Optional compile-time node/depth limits and caller-provided allocators.
+- `printf`-based tree debug output can be removed with `TIE_DISABLE_PRINT`.
 
 ## Building
 
-TinyIntegerExpr is self-contained in two files: `tinyintegerexpr.c` and `tinyintegerexpr.h`. To use
-TinyIntegerExpr, simply add those two files to your project.
+Add `tinyintegerexpr.c` and `tinyintegerexpr.h` to your project. For Arduino,
+compile `tinyintegerexpr.c` as C, include `tinyintegerexpr.h` from your sketch or
+C++ code, and prefer the status-returning APIs shown below.
+
+The default expression limits are:
+
+```c
+#define TIE_DEFAULT_MAX_NODES 128u
+#define TIE_DEFAULT_MAX_DEPTH 32u
+```
+
+Override them at compile time or pass `tie_options` to `tie_compile_ex()` /
+`tie_interp_status()`.
 
 ## Short Example
 
-Here is a minimal example to evaluate an expression at runtime.
+```c
+#include "tinyintegerexpr.h"
+#include <stdio.h>
 
-```C
-    #include "tinyintegerexpr.h"
-    printf("%d\n", tie_interp("5*5", 0)); /* Prints 25. */
-```
+int main(void) {
+    int err = 0;
+    tie_status status = TIE_OK;
+    int value = tie_interp_status("5 * (2 + 3)", &err, &status, NULL);
 
-
-## Usage
-
-TinyIntegerExpr defines only four functions:
-
-```C
-    int tie_interp(const char *expression, int *error);
-    tie_expression *tie_compile(const char *expression, const tie_variable *variables, int var_count, int *error);
-    int tie_eval(const tie_expression *expr);
-    void tie_free(tie_expression *expr);
-```
-
-## tie_interp
-```C
-    int tie_interp(const char *expression, int *error);
-```
-
-`tie_interp()` takes an expression and immediately returns the result of it. If there
-is a parse error, `tie_interp()` returns NaN.
-
-If the `error` pointer argument is not 0, then `tie_interp()` will set `*error` to the position
-of the parse error on failure, and set `*error` to 0 on success.
-
-**example usage:**
-
-```C
-    int error;
-
-    int a = tie_interp("(5+5)", 0); /* Returns 10. */
-    int b = tie_interp("(5+5)", &error); /* Returns 10, error is set to 0. */
-    int c = tie_interp("(5+5", &error); /* Returns NaN, error is set to 4. */
-```
-
-## tie_compile, tie_eval, tie_free
-```C
-    tie_expression *tie_compile(const char *expression, const tie_variable *lookup, int lookup_len, int *error);
-    int tie_eval(const tie_expression *n);
-    void tie_free(tie_expression *n);
-```
-
-Give `tie_compile()` an expression with unbound variables and a list of
-variable names and pointers. `tie_compile()` will return a `tie_expression*` which can
-be evaluated later using `tie_eval()`. On failure, `tie_compile()` will return 0
-and optionally set the passed in `*error` to the location of the parse error.
-
-You may also compile expressions without variables by passing `tie_compile()`'s second
-and third arguments as 0.
-
-Give `tie_eval()` a `tie_expression*` from `tie_compile()`. `tie_eval()` will evaluate the expression
-using the current variable values.
-
-After you're finished, make sure to call `tie_free()`.
-
-**example usage:**
-
-```C
-    int x, y;
-    /* Store variable names and pointers. */
-    tie_variable vars[] = {{"x", &x}, {"y", &y}};
-
-    int err;
-    /* Compile the expression with variables. */
-    tie_expression *expr = tie_compile("(x*2+y*2)", vars, 2, &err);
-
-    if (expr) {
-        x = 3; y = 4;
-        const int h1 = tie_eval(expr); /* Returns 5. */
-
-        x = 5; y = 12;
-        const int h2 = tie_eval(expr); /* Returns 13. */
-
-        tie_free(expr);
-    } else {
-        printf("Parse error at %d\n", err);
+    if (status == TIE_OK) {
+        printf("%d\n", value); /* Prints 25. */
     }
-
+}
 ```
 
-## Longer Example
+## API
 
-Here is a complete example that will evaluate an expression passed in from the command
-line. It also does error checking and binds the variables `x` and `y` to *3* and *4*, respectively.
+```c
+int tie_interp(const char *expression, int *error);
+int tie_interp_status(const char *expression, int *error,
+                      tie_status *status, const tie_options *options);
 
-```C
-    #include "tinyintegerexpr.h"
-    #include <stdio.h>
+tie_expression *tie_compile(const char *expression,
+                            const tie_variable *variables,
+                            int var_count, int *error);
+tie_expression *tie_compile_ex(const char *expression,
+                               const tie_variable *variables,
+                               int var_count, int *error,
+                               tie_status *status,
+                               const tie_options *options);
 
-    int main(int argc, char *argv[])
-    {
-        if (argc < 2) {
-            printf("Usage: example2 \"expression\"\n");
-            return 0;
-        }
+int tie_eval(const tie_expression *expr);
+int tie_eval_status(const tie_expression *expr, tie_status *status);
 
-        const char *expression = argv[1];
-        printf("Evaluating:\n\t%s\n", expression);
+void tie_free(tie_expression *expr);
+void tie_free_ex(tie_expression *expr, const tie_allocator *allocator);
 
-        /* This shows an example where the variables
-         * x and y are bound at eval-time. */
-        int x, y;
-        tie_variable vars[] = {{"x", &x}, {"y", &y}};
-
-        /* This will compile the expression and check for errors. */
-        int err;
-        tie_expression *n = tie_compile(expression, vars, 2, &err);
-
-        if (n) {
-            /* The variables can be changed here, and eval can be called as many
-             * times as you like. This is fairly efficient because the parsing has
-             * already been done. */
-            x = 3; y = 4;
-            const int r = tie_eval(n); printf("Result:\n\t%d\n", r);
-            tie_free(n);
-        } else {
-            /* Show the user where the error is at. */
-            printf("\t%*s^\nError near here", err-1, "");
-        }
-
-        return 0;
-    }
+const char *tie_status_message(tie_status status);
 ```
 
+The compatibility functions `tie_interp()`, `tie_compile()`, and `tie_eval()`
+return `0` on runtime error. Use the `_status` variants when `0` is a valid
+result or when you need to distinguish parse, allocation, limit, and runtime
+errors.
 
-This produces the output:
+## Variables
 
-    $ example2 "(x*2+y2)"
-        Evaluating:
-                (x*2+y2)
-                      ^
-        Error near here
+```c
+int x = 3;
+int y = 4;
 
+tie_variable vars[] = {
+    TIE_VAR("x", &x),
+    TIE_VAR("y", &y),
+};
 
-    $ example2 "(x*2+y*2)"
-        Evaluating:
-                (x*2+y*2)
-        Result:
-                14
+int err = 0;
+tie_status status = TIE_OK;
+tie_expression *expr = tie_compile_ex("x * 2 + y", vars, 2, &err, &status, NULL);
 
+if (expr != NULL) {
+    int value = tie_eval_status(expr, &status); /* 10 */
+    tie_free(expr);
+}
+```
 
-## Binding to Custom Functions
+## Custom Functions
 
-TinyIntegerExpr can also call to custom functions implemented in C. Here is a short example:
+Custom functions must use `int` arguments and return `int`.
 
-```C
-int my_sum(int a, int b) {
-    /* Example C function that adds two numbers together. */
+```c
+static int my_sum(int a, int b) {
     return a + b;
 }
 
 tie_variable vars[] = {
-    {"mysum", my_sum, TE_FUNCTION2} /* TIE_FUNCTION2 used because my_sum takes two arguments. */
+    TIE_FN2("mysum", my_sum),
 };
 
-tie_expression *n = tie_compile("mysum(5, 6)", vars, 1, 0);
-
+tie_expression *expr = tie_compile("mysum(5, 6)", vars, 1, NULL);
 ```
-## Speed
 
+Closures receive the configured context pointer as their first argument:
 
-TinyIntegerExpr is pretty fast compared to C when the expression is short, when the
-expression does hard calculations (e.g. exponentiation), and when some of the
-work can be simplified by `tie_compile()`. TinyIntegerExpr is slow compared to C when the
-expression is long and involves only basic arithmetic.
+```c
+static int plus_context(void *context, int value) {
+    return *((int *) context) + value;
+}
 
-Here are some made up performance numbers taken from the included
-**benchmark.c** program:
+int extra = 10;
+tie_variable vars[] = {
+    TIE_CLOSURE_FN1("plus_extra", plus_context, &extra),
+};
+```
 
-| Expression                | tie_eval time | native C time |    slowdown |
-|:--------------------------|--------------:|--------------:|------------:|
-| a+5                       |        765 ms |        563 ms |  36% slower |
-| a+(5*2)                   |        765 ms |        563 ms |  36% slower |
-| (a+5)*2                   |       1422 ms |        563 ms | 153% slower |
-| (1/(a+1)+2/(a+2)+3/(a+3)) |      5,516 ms |      1,266 ms | 336% slower |
+## Embedded Options
 
+`tie_options` lets embedded callers constrain parser resource use and provide
+their own allocator:
 
+```c
+static unsigned char arena[256];
+static tie_allocator my_allocator = {
+    my_malloc,
+    my_free,
+    arena,
+};
+
+tie_options options = {
+    &my_allocator,
+    32u, /* max_nodes */
+    16u, /* max_depth */
+};
+```
+
+If you compile with a custom allocator, release the tree with
+`tie_free_ex(expr, options.allocator)`.
 
 ## Grammar
 
-TinyIntegerExpr parses the following grammar:
+```text
+<list>      = <bit_or> {"," <bit_or>}
+<bit_or>    = <bit_xor> {"|" <bit_xor>}
+<bit_xor>   = <bit_and> {"^" <bit_and>}
+<bit_and>   = <shift> {"&" <shift>}
+<shift>     = <expr> {("<<" | ">>" | "<" | ">") <expr>}
+<expr>      = <term> {("+" | "-") <term>}
+<term>      = <unary> {("*" | "/" | "%") <unary>}
+<unary>     = {("+" | "-" | "~")} <base>
+<base>      = <integer>
+            | <variable>
+            | <function-0> {"(" ")"}
+            | <function-1> <unary>
+            | <function-N> "(" <bit_or> {"," <bit_or>} ")"
+            | "(" <list> ")"
+```
 
-    <list>      = <bitwise> {"," <bitwise>}
-    <bitwise>   = <shift> {("&" | "^" | "|" ) <shift>}
-    <shift>     = <expr> {("<" | ">") <expr>}
-    <expr>      = <term> {("+" | "-") <term>}
-    <term>      = <unary> {("*" | "/" | "%") <unary>}
-    <unary>     =    {("-" | "+")} <base>
-    <base>      =    <constant>
-                   | <variable>
-                   | <function-0> {"(" ")"}
-                   | <function-1> <unary>
-                   | <function-X> "(" <expr> {"," <expr>} ")"
-                   | "(" <list> ")"
+Whitespace between tokens is ignored. Variable names start with a letter and may
+then contain letters, digits, or underscores.
 
-In addition, whitespace between tokens is ignored.
+## Built-ins
 
-Valid variable names consist of a letter followed by any combination of:
-letters, the digits *0* through *9*, and underscore. Constants **_must_** be integers, or in scientific notation (e.g.  *1e3* for *1000*). 
+- Arithmetic: `+`, `-`, `*`, `/`, `%`
+- Unary: `+`, `-`, `~`, `abs`
+- Bitwise: `&`, `^`, `|`
+- Shifts: `<<`, `>>`; single-character `<` and `>` are still accepted for
+  compatibility
+- Comma list operator: `,`
+- Short-circuit conditional function: `if(condition, if_true, if_false)`
 
-## Functions supported
+## Verification
 
-TinyIntegerExpr supports:
-* addition (`+`)
-* subtraction/negation (`-`) 
-* multiplication (`*`)
-* division (`/`)
-* modulus (`%`) 
-* Bitwise AND (`&`)
-* Bitwise OR (`|`)
-* Bitwise XOR (`^`)
-* Right Shift (`>`)
-* Left Shift (`<`)
-* Ternary Expression Function (`if(expr, if_true, if_false)`)
+Run:
 
-following the standard "C" operator precedence
+```sh
+make
+```
 
-## Hints
-
-- All functions/types start with the letters *tie*.
-
-- To allow constant optimization, surround constant expressions in parentheses.
-  For example "x+(1+5)" will evaluate the "(1+5)" expression at compile time and
-  compile the entire expression as "x+6", saving a runtime calculation. The
-  parentheses are important, because TinyIntegerExpr will not change the order of
-  evaluation. If you instead compiled "x+1+5" TinyIntegerExpr will insist that "1" is
-  added to "x" first, and "5" is added the result second.
-
+The default build runs the smoke tests, compiles the core as C++17, and builds
+the examples, REPL, and benchmark.

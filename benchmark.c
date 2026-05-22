@@ -1,136 +1,108 @@
-/*
- * TINYEXPR - Tiny recursive descent parser and evaluation engine in C
- *
- * Copyright (c) 2015, 2016 Lewis Van Winkle
- *
- * http://CodePlea.com
- *
- * This software is provided 'as-is', without any express or implied
- * warranty. In no event will the authors be held liable for any damages
- * arising from the use of this software.
- *
- * Permission is granted to anyone to use this software for any purpose,
- * including commercial applications, and to alter it and redistribute it
- * freely, subject to the following restrictions:
- *
- * 1. The origin of this software must not be misrepresented; you must not
- * claim that you wrote the original software. If you use this software
- * in a product, an acknowledgement in the product documentation would be
- * appreciated but is not required.
- * 2. Altered source versions must be plainly marked as such, and must not be
- * misrepresented as being the original software.
- * 3. This notice may not be removed or altered from any source distribution.
- */
-
-#include <stdio.h>
-#include <time.h>
-#include <math.h>
 #include "tinyintegerexpr.h"
 
-
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 #define loops 10000
 
+typedef int (*function1)(int);
 
+static void bench(const char *expr, function1 func) {
+  int i;
+  int j;
+  volatile long long total;
+  int tmp;
+  clock_t start;
 
-typedef double (*function1)(double);
+  tie_variable vars[] = {
+      TIE_VAR("a", &tmp),
+  };
 
-void bench(const char *expr, function1 func) {
-    int i, j;
-    volatile double d;
-    double tmp;
-    clock_t start;
+  printf("Expression: %s\n", expr);
 
-    tie_variable lk = {"a", &tmp};
+  printf("native ");
+  start = clock();
+  total = 0;
+  for (j = 0; j < loops; ++j) {
+    for (i = 0; i < loops; ++i) {
+      tmp = i;
+      total += func(tmp);
+    }
+  }
+  const int nelapsed = (int) ((clock() - start) * 1000 / CLOCKS_PER_SEC);
 
-    printf("Expression: %s\n", expr);
+  printf(" %lld", total);
+  if (nelapsed) {
+    printf("\t%5dms\t%5dmops\n", nelapsed, loops * loops / nelapsed / 1000);
+  } else {
+    printf("\tinf\n");
+  }
 
-    printf("native ");
-    start = clock();
-    d = 0;
-    for (j = 0; j < loops; ++j)
-        for (i = 0; i < loops; ++i) {
-            tmp = i;
-            d += func(tmp);
-        }
-    const int nelapsed = (clock() - start) * 1000 / CLOCKS_PER_SEC;
+  printf("interp ");
+  int err = 0;
+  tie_status status = TIE_OK;
+  tie_expression *n = tie_compile_ex(expr, vars, 1, &err, &status, NULL);
+  if (n == NULL) {
+    printf("compile failed at %d: %s\n", err, tie_status_message(status));
+    return;
+  }
 
-    /* mfps = Million floats per second.*/
-    printf(" %.5g", d);
-    if (nelapsed)
-        printf("\t%5dms\t%5dmfps\n", nelapsed, loops * loops / nelapsed / 1000);
-    else
-        printf("\tinf\n");
+  start = clock();
+  total = 0;
+  for (j = 0; j < loops; ++j) {
+    for (i = 0; i < loops; ++i) {
+      tmp = i;
+      total += tie_eval(n);
+    }
+  }
+  const int eelapsed = (int) ((clock() - start) * 1000 / CLOCKS_PER_SEC);
+  tie_free(n);
 
+  printf(" %lld", total);
+  if (eelapsed) {
+    printf("\t%5dms\t%5dmops\n", eelapsed, loops * loops / eelapsed / 1000);
+  } else {
+    printf("\tinf\n");
+  }
 
-
-
-    printf("interp ");
-    tie_expression *n = tie_compile(expr, &lk, 1, 0);
-    start = clock();
-    d = 0;
-    for (j = 0; j < loops; ++j)
-        for (i = 0; i < loops; ++i) {
-            tmp = i;
-            d += tie_eval(n);
-        }
-    const int eelapsed = (clock() - start) * 1000 / CLOCKS_PER_SEC;
-    tie_free(n);
-
-    /*Million floats per second input.*/
-    printf(" %.5g", d);
-    if (eelapsed)
-        printf("\t%5dms\t%5dmfps\n", eelapsed, loops * loops / eelapsed / 1000);
-    else
-        printf("\tinf\n");
-
-
-    printf("%.2f%% longer\n", (((double)eelapsed / nelapsed) - 1.0) * 100.0);
-
-
-    printf("\n");
+  if (nelapsed) {
+    printf("%.2f%% longer\n", (((double) eelapsed / nelapsed) - 1.0) * 100.0);
+  }
+  printf("\n");
 }
 
-
-double a5(double a) {
-    return a+5;
+static int a5(int a) {
+  return a + 5;
 }
 
-double a55(double a) {
-    return 5+a+5;
+static int a55(int a) {
+  return 5 + a + 5;
 }
 
-double a5abs(double a) {
-    return fabs(a+5);
+static int a5abs(int a) {
+  return abs(a + 5);
 }
 
-double a52(double a) {
-    return (a+5)*2;
+static int a52(int a) {
+  return (a + 5) * 2;
 }
 
-double a10(double a) {
-    return a+(5*2);
+static int a10(int a) {
+  return a + (5 * 2);
 }
 
-double as(double a) {
-    return sqrt(pow(a, 1.5) + pow(a, 2.5));
+static int bitmix(int a) {
+  return ((a & 255) << 2) ^ 17;
 }
 
-double al(double a) {
-    return (1/(a+1)+2/(a+2)+3/(a+3));
-}
+int main(void) {
+  bench("a+5", a5);
+  bench("5+a+5", a55);
+  bench("abs(a+5)", a5abs);
+  bench("a+(5*2)", a10);
+  bench("(a+5)*2", a52);
+  bench("((a&255)<<2)^17", bitmix);
 
-int main(int argc, char *argv[])
-{
-
-    bench("a+5", a5);
-    bench("5+a+5", a55);
-    bench("abs(a+5)", a5abs);
-
-    bench("sqrt(a^1.5+a^2.5)", as);
-    bench("a+(5*2)", a10);
-    bench("(a+5)*2", a52);
-    bench("(1/(a+1)+2/(a+2)+3/(a+3))", al);
-
-    return 0;
+  return 0;
 }

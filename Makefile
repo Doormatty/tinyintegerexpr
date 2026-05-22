@@ -1,19 +1,20 @@
 CC = gcc
-CCFLAGS = -Wall -Wshadow -O2
-LFLAGS = -lm
+CXX = g++
+CCFLAGS = -std=c99 -Wall -Wextra -Wshadow -Wconversion -Wpedantic -O2
+CXXFLAGS = -std=c++17 -Wall -Wextra -Wpedantic -O2
+LFLAGS =
 
-.PHONY = all clean
+.PHONY: all clean cppcheck
 
-all: smoke smoke_pr repl bench example example2 example3
+all: smoke cppcheck repl bench example example2 example3
 
 
 smoke: smoke.c tinyintegerexpr.c
 	$(CC) $(CCFLAGS) -o $@ $^ $(LFLAGS)
 	./$@
 
-smoke_pr: smoke.c tinyintegerexpr.c
-	$(CC) $(CCFLAGS) -DTE_POW_FROM_RIGHT -DTE_NAT_LOG -o $@ $^ $(LFLAGS)
-	./$@
+cppcheck: tinyintegerexpr.c tinyintegerexpr.h
+	$(CXX) $(CXXFLAGS) -x c++ -c tinyintegerexpr.c -o tinyintegerexpr_cpp.o
 
 repl: repl.o tinyintegerexpr.o
 	$(CC) $(CCFLAGS) -o $@ $^ $(LFLAGS)
@@ -40,4 +41,4 @@ repl-readline.o: repl.c
 	$(CC) -c $(CCFLAGS) $< -o $@
 
 clean:
-	rm -f *.o *.exe example example2 example3 bench repl smoke_pr smoke
+	rm -f *.o *.exe example example2 example3 bench repl smoke

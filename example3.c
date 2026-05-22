@@ -1,35 +1,37 @@
 #include "tinyintegerexpr.h"
+
 #include <stdio.h>
 
-
-/* An example of calling a C function. */
-double my_sum(double a, double b) {
-    printf("Called C function with %f and %f.\n", a, b);
-    return a + b;
+static int my_sum(int a, int b) {
+  printf("Called C function with %d and %d.\n", a, b);
+  return a + b;
 }
 
+int main(void) {
+  tie_variable vars[] = {
+      TIE_FN2("mysum", my_sum),
+  };
 
-int main(int argc, char *argv[])
-{
-    tie_variable vars[] = {
-        {"mysum", my_sum, TIE_FUNCTION2}
-    };
+  const char *expression = "mysum(5, 6)";
+  printf("Evaluating:\n\t%s\n", expression);
 
-    const char *expression = "mysum(5, 6)";
-    printf("Evaluating:\n\t%s\n", expression);
+  int err = 0;
+  tie_status status = TIE_OK;
+  tie_expression *n = tie_compile_ex(expression, vars, (int) (sizeof(vars) / sizeof(vars[0])), &err, &status, NULL);
 
-    int err;
-    tie_expression *n = tie_compile(expression, vars, 1, &err);
+  if (n == NULL) {
+    printf("\t%*s^\n%s\n", err > 0 ? err - 1 : 0, "", tie_status_message(status));
+    return 1;
+  }
 
-    if (n) {
-        const double r = tie_eval(n);
-        printf("Result:\n\t%f\n", r);
-        tie_free(n);
-    } else {
-        /* Show the user where the error is at. */
-        printf("\t%*s^\nError near here", err-1, "");
-    }
+  const int result = tie_eval_status(n, &status);
+  tie_free(n);
 
+  if (status != TIE_OK) {
+    printf("%s\n", tie_status_message(status));
+    return 1;
+  }
 
-    return 0;
+  printf("Result:\n\t%d\n", result);
+  return 0;
 }

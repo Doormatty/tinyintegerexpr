@@ -33,17 +33,25 @@ static char *readline(const char *prompt) {
     return line;
 }
 
-static void add_history(const char *line) {}
+static void add_history(const char *line) {(void) line;}
 #endif
 
 static int eval(const char *str) {
     int err = 0;
-    double r = tie_interp(str, &err);
-    if (err != 0) {
+    tie_status status = TIE_OK;
+    int r = tie_interp_status(str, &err, &status, NULL);
+    if (status != TIE_OK) {
+        if (err != 0) {
+            printf("Error at position %i: %s\n", err, tie_status_message(status));
+        } else {
+            printf("%s\n", tie_status_message(status));
+        }
+        return -1;
+    } else if (err != 0) {
         printf("Error at position %i\n", err);
         return -1;
     } else {
-        printf("%g\n", r);
+        printf("%d\n", r);
         return 0;
     }
 }

@@ -1,10 +1,18 @@
 #include "tinyintegerexpr.h"
+
 #include <stdio.h>
 
-int main(int argc, char *argv[])
-{
-    const char *c = "sqrt(5^2+7^2+11^2+(8-2)^2)";
-    double r = tie_interp(c, 0);
-    printf("The expression:\n\t%s\nevaluates to:\n\t%f\n", c, r);
-    return 0;
+int main(void) {
+  const char *expr = "(5 * 5) + (7 * 7) + (11 * 11) + ((8 - 2) * (8 - 2))";
+  int err = 0;
+  tie_status status = TIE_OK;
+  const int result = tie_interp_status(expr, &err, &status, NULL);
+
+  if (status != TIE_OK) {
+    printf("Error at %d: %s\n", err, tie_status_message(status));
+    return 1;
+  }
+
+  printf("The expression:\n\t%s\nevaluates to:\n\t%d\n", expr, result);
+  return 0;
 }

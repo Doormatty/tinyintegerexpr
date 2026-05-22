@@ -1,38 +1,40 @@
 #include "tinyintegerexpr.h"
+
 #include <stdio.h>
 
-int main(int argc, char *argv[])
-{
-    if (argc < 2) {
-        printf("Usage: example2 \"expression\"\n");
-        return 0;
-    }
-
-    const char *expression = argv[1];
-    printf("Evaluating:\n\t%s\n", expression);
-
-    /* This shows an example where the variables
-     * x and y are bound at eval-time. */
-    double x, y;
-    tie_variable vars[] = {{"x", &x}, {"y", &y}};
-
-    /* This will compile the expression and check for errors. */
-    int err;
-    tie_expression *n = tie_compile(expression, vars, 2, &err);
-
-    if (n) {
-        /* The variables can be changed here, and eval can be called as many
-         * times as you like. This is fairly efficient because the parsing has
-         * already been done. */
-        x = 3; y = 4;
-        const double r = tie_eval(n); printf("Result:\n\t%f\n", r);
-
-        tie_free(n);
-    } else {
-        /* Show the user where the error is at. */
-        printf("\t%*s^\nError near here", err-1, "");
-    }
-
-
+int main(int argc, char *argv[]) {
+  if (argc < 2) {
+    printf("Usage: example2 \"expression\"\n");
     return 0;
+  }
+
+  const char *expression = argv[1];
+  printf("Evaluating:\n\t%s\n", expression);
+
+  int x = 3;
+  int y = 4;
+  tie_variable vars[] = {
+      TIE_VAR("x", &x),
+      TIE_VAR("y", &y),
+  };
+
+  int err = 0;
+  tie_status status = TIE_OK;
+  tie_expression *n = tie_compile_ex(expression, vars, (int) (sizeof(vars) / sizeof(vars[0])), &err, &status, NULL);
+
+  if (n == NULL) {
+    printf("\t%*s^\n%s\n", err > 0 ? err - 1 : 0, "", tie_status_message(status));
+    return 1;
+  }
+
+  const int result = tie_eval_status(n, &status);
+  tie_free(n);
+
+  if (status != TIE_OK) {
+    printf("%s\n", tie_status_message(status));
+    return 1;
+  }
+
+  printf("Result:\n\t%d\n", result);
+  return 0;
 }
