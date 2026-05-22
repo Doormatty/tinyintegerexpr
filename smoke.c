@@ -16,6 +16,15 @@ typedef struct {
   tie_status status;
 } status_case;
 
+typedef struct {
+  const char *expr;
+  int t;
+  int a;
+  int b;
+  int c;
+  int answer;
+} equation_case;
+
 static void expect_ok(const char *expr, int answer) {
   int err = -1;
   tie_status status = TIE_ERR_PARSE;
@@ -157,6 +166,94 @@ static void test_runtime_errors(void) {
   tie_free(n);
 }
 
+static void expect_equation_ok(const equation_case *sample) {
+  int t = sample->t;
+  int a = sample->a;
+  int b = sample->b;
+  int c = sample->c;
+  tie_variable vars[] = {
+      TIE_VAR("t", &t),
+      TIE_VAR("a", &a),
+      TIE_VAR("b", &b),
+      TIE_VAR("c", &c),
+  };
+
+  int err = 0;
+  tie_status status = TIE_OK;
+  tie_expression *n = tie_compile_ex(sample->expr, vars, ARRAY_LEN(vars), &err, &status, NULL);
+  lok(n != NULL);
+  lequal(err, 0);
+  lequal(status, TIE_OK);
+
+  if (n == NULL) {
+    return;
+  }
+
+  lequal(tie_eval_status(n, &status), sample->answer);
+  lequal(status, TIE_OK);
+  tie_free(n);
+}
+
+static void test_equation_samples(void) {
+  const equation_case cases[] = {
+      {"if(t & (4 << c), ((t * (t ^ t & a) | (t >> b)) >> 1), "
+       "(t >> 4) | if(t & (c << b), t << 1, t))",
+       257, 3, 5, 2, 273},
+      {"if(t & (4 << c), ((t * (t ^ t & a) | (t >> b)) >> 1), "
+       "(t >> 4) | if(t & (c << b), t << 1, t))",
+       80, 3, 5, 2, 3201},
+      {"(if(t >> 6, 2, a)&t * (t >> c) | b - (t >> a)) % (t >> b) + "
+       "(4 | (t >> c))",
+       257, 3, 5, 2, 65},
+      {"(if(t >> b, c, a)&t * a | 8 - (t >> 1)) % (t >> b) + "
+       "(4 | (t >> c))",
+       257, 3, 5, 2, 62},
+      {"((t*(t>>a|t>>(a+1))&b&t>>8))^(t&t>>13|t>>6)",
+       257, 3, 5, 2, 4},
+      {"t+(t&t^t>>(b*2-c))-t*((t>>a)&if(t%c,2,a-c)&t>>b)",
+       257, 3, 5, 2, 513},
+      {"t>>6^t&37|t+(t^t>>11)-t*(if(t%a,2,6)&t>>11)^t<<1&"
+       "if(t&b,t>>4,t>>10)",
+       257, 3, 5, 2, 519},
+      {"if(t>>b&t,t>>a,-t>>c)", 257, 3, 5, 2, 1073741759},
+      {"if(t>>b&t,t>>a,-t>>c)", 291, 3, 5, 2, 36},
+      {"if(t & (4 << a), ((-t * (t ^ t) | (t >> b)) >> c), "
+       "(t >> 4) | if(t & (c << b), t << 1, t))",
+       64, 3, 5, 2, 132},
+      {"((t>>a&t)-(t>>a)+(t>>a&t))+(t*((t>>b)&b))",
+       257, 3, 5, 2, -32},
+      {"(t * 5 & t >> 7) | (t * 3 & t >> 10)",
+       257, 3, 5, 2, 0},
+      {"(t * a & t >> b | t * c & t >> 7 | t * 3 & t / 1024) - 1",
+       257, 3, 5, 2, 1},
+      {"(t*((t>>a|t<<c)&29&t>>b))", 257, 3, 5, 2, 0},
+      {"((t & (t >> a)) + (t | (t >> b))) & (t >> (c + 1)) | "
+       "(t >> a) & (t * (t >> b))",
+       257, 3, 5, 2, 0},
+      {"((t * (t >> a | t >> (a & c))&b & t >> 8)) ^ "
+       "(t & t >> c | t >> 6)",
+       257, 3, 5, 2, 4},
+      {"((t * (t >> a) & (b * t >> 7) & (8 * t >> c)))",
+       257, 3, 5, 2, 0},
+      {"((t >> c) * 7 | (t >> a) * 8 | (t >> b) * 7) & (t >> 7)",
+       257, 3, 5, 2, 0},
+      {"(t >> a | c | t >> (t >> 16)) * b + (t >> (b + 1))",
+       257, 3, 5, 2, 1459},
+      {"b * t >> a ^ t & (37 - c) | t + (t ^ t >> 11) - "
+       "t * (if(t >> 6, 2, a)&t >> (c + b))^t << 1 & "
+       "if(t & 6,t >> 4,t >> c)",
+       257, 3, 5, 2, 161},
+      {"t >> c ^ t & 37 | t + (t ^ t >> a) - "
+       "t * (if(t >> a, 2, 6)&t >> b)^t << 1 & "
+       "if(t & b,t >> 4,t >> 10)",
+       257, 3, 5, 2, 611},
+  };
+
+  for (int i = 0; i < ARRAY_LEN(cases); ++i) {
+    expect_equation_ok(cases + i);
+  }
+}
+
 static void test_variables(void) {
   int x = 3;
   int y = 4;
@@ -266,6 +363,7 @@ int main(void) {
   lrun("Results", test_results);
   lrun("Syntax", test_syntax);
   lrun("Runtime", test_runtime_errors);
+  lrun("Equations", test_equation_samples);
   lrun("Variables", test_variables);
   lrun("Functions", test_functions);
   lrun("Closure", test_closure);
