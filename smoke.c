@@ -121,6 +121,40 @@ static void test_runtime_errors(void) {
   (void) tie_eval_status(n, &status);
   lequal(status, TIE_ERR_OVERFLOW);
   tie_free(n);
+
+  int x = INT_MAX;
+  tie_variable fast_vars[] = {
+      TIE_VAR("x", &x),
+  };
+
+  n = tie_compile_ex("x+1", fast_vars, ARRAY_LEN(fast_vars), &err, &status, NULL);
+  lok(n != NULL);
+  lequal(err, 0);
+  lequal(status, TIE_OK);
+  (void) tie_eval_status(n, &status);
+  lequal(status, TIE_ERR_OVERFLOW);
+  lequal(tie_eval(n), 0);
+  tie_free(n);
+
+  x = 0;
+  n = tie_compile_ex("1/x", fast_vars, ARRAY_LEN(fast_vars), &err, &status, NULL);
+  lok(n != NULL);
+  lequal(err, 0);
+  lequal(status, TIE_OK);
+  (void) tie_eval_status(n, &status);
+  lequal(status, TIE_ERR_DIVIDE_BY_ZERO);
+  lequal(tie_eval(n), 0);
+  tie_free(n);
+
+  x = -1;
+  n = tie_compile_ex("1<<x", fast_vars, ARRAY_LEN(fast_vars), &err, &status, NULL);
+  lok(n != NULL);
+  lequal(err, 0);
+  lequal(status, TIE_OK);
+  (void) tie_eval_status(n, &status);
+  lequal(status, TIE_ERR_SHIFT_RANGE);
+  lequal(tie_eval(n), 0);
+  tie_free(n);
 }
 
 static void test_variables(void) {

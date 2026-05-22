@@ -18,7 +18,8 @@ enum {
   TIE_CONSTANT = 1,
   TIE_BUILTIN1,
   TIE_BUILTIN2,
-  TIE_BUILTIN3
+  TIE_BUILTIN3,
+  TIE_FAST_CHAIN
 };
 
 enum {
@@ -56,6 +57,48 @@ typedef struct tie_builtin {
   int type;
   tie_operation operation;
 } tie_builtin;
+
+typedef enum tie_fast_instruction_type {
+  TIE_FAST_NEG,
+  TIE_FAST_BIT_NOT,
+  TIE_FAST_ABS,
+  TIE_FAST_ADD_RIGHT,
+  TIE_FAST_SUB_RIGHT,
+  TIE_FAST_SUB_LEFT,
+  TIE_FAST_MUL_RIGHT,
+  TIE_FAST_DIV_RIGHT,
+  TIE_FAST_DIV_LEFT,
+  TIE_FAST_MOD_RIGHT,
+  TIE_FAST_MOD_LEFT,
+  TIE_FAST_BIT_AND_RIGHT,
+  TIE_FAST_BIT_OR_RIGHT,
+  TIE_FAST_BIT_XOR_RIGHT,
+  TIE_FAST_SHL_RIGHT,
+  TIE_FAST_SHL_LEFT,
+  TIE_FAST_SHR_RIGHT,
+  TIE_FAST_SHR_LEFT
+} tie_fast_instruction_type;
+
+typedef enum tie_fast_chain_shape {
+  TIE_FAST_SHAPE_GENERIC,
+  TIE_FAST_SHAPE_ADD,
+  TIE_FAST_SHAPE_ADD_ADD,
+  TIE_FAST_SHAPE_ADD_ABS,
+  TIE_FAST_SHAPE_ADD_MUL,
+  TIE_FAST_SHAPE_BIT_AND_SHL_XOR
+} tie_fast_chain_shape;
+
+typedef struct tie_fast_instruction {
+  tie_fast_instruction_type type;
+  int value;
+} tie_fast_instruction;
+
+typedef struct tie_fast_chain {
+  const volatile int *bound;
+  int instruction_count;
+  tie_fast_chain_shape shape;
+  tie_fast_instruction instructions[1];
+} tie_fast_chain;
 
 typedef struct state {
   const char *start;
@@ -104,6 +147,30 @@ static const tie_builtin builtins[] = {
 #define IS_FUNCTION(TYPE) (TYPE_MASK(TYPE) >= TIE_FUNCTION0 && TYPE_MASK(TYPE) <= TIE_FUNCTION7)
 #define IS_CLOSURE(TYPE) (TYPE_MASK(TYPE) >= TIE_CLOSURE0 && TYPE_MASK(TYPE) <= TIE_CLOSURE7)
 
+#define TIE_CONST_RIGHT 0x00000040
+#define TIE_CONST_LEFT 0x00000080
+#define TIE_ENCODED_OPERATION_SHIFT 8
+#define TIE_ENCODED_OPERATION_MASK 0x0000FF00
+#define HAS_INLINE_CONSTANT(TYPE) (((TYPE) & (TIE_CONST_RIGHT | TIE_CONST_LEFT)) != 0)
+#define INLINE_CONSTANT_LEFT(TYPE) (((TYPE) & TIE_CONST_LEFT) != 0)
+#define ENCODE_OPERATION(OPERATION) (((int) (OPERATION)) << TIE_ENCODED_OPERATION_SHIFT)
+#define DECODE_OPERATION(TYPE) \
+  ((tie_operation) (((TYPE) & TIE_ENCODED_OPERATION_MASK) >> TIE_ENCODED_OPERATION_SHIFT))
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TIE_HAS_OVERFLOW_BUILTINS 1
+#define TIE_FORCE_INLINE static inline __attribute__((always_inline))
+#define TIE_NOINLINE static __attribute__((noinline))
+#else
+#define TIE_HAS_OVERFLOW_BUILTINS 0
+#define TIE_FORCE_INLINE static inline
+#define TIE_NOINLINE static
+#endif
+
+#ifndef TIE_FAST_CHAIN_LIMIT
+#define TIE_FAST_CHAIN_LIMIT 128
+#endif
+
 static int arity_of(const int type) {
   switch (TYPE_MASK(type)) {
     case TIE_BUILTIN1:
@@ -112,6 +179,8 @@ static int arity_of(const int type) {
       return 2;
     case TIE_BUILTIN3:
       return 3;
+    case TIE_FAST_CHAIN:
+      return 1;
     default:
       if (IS_FUNCTION(type) || IS_CLOSURE(type)) {
         return type & 0x00000007;
@@ -135,6 +204,13 @@ static void set_eval_error(tie_status *status, const tie_status value) {
   }
 }
 
+TIE_FORCE_INLINE tie_operation node_operation(const tie_expression *n) {
+  if (HAS_INLINE_CONSTANT(n->type)) {
+    return DECODE_OPERATION(n->type);
+  }
+  return (tie_operation) n->data.operation;
+}
+
 static const tie_allocator *allocator_for_alloc(const tie_allocator *allocator) {
   if (allocator != NULL && allocator->malloc_fn != NULL) {
     return allocator;
@@ -151,6 +227,10 @@ static const tie_allocator *allocator_for_free(const tie_allocator *allocator) {
 
 static void release_node(tie_expression *n, const tie_allocator *allocator) {
   const tie_allocator *actual = allocator_for_free(allocator);
+  if (TYPE_MASK(n->type) == TIE_FAST_CHAIN && n->context != NULL && actual->free_fn != NULL) {
+    actual->free_fn(n->context, actual->context);
+    n->context = NULL;
+  }
 #ifdef __cplusplus
   n->~tie_expression();
 #endif
@@ -189,22 +269,16 @@ void tie_free(tie_expression *n) {
   tie_free_internal(n, &default_allocator);
 }
 
-static tie_expression *new_expr(state *s, const int type) {
+static tie_expression *allocate_expr(const tie_allocator *allocator, const int type) {
   const int arity = ARITY(type);
-
-  if (s->max_nodes != 0U && s->node_count >= s->max_nodes) {
-    set_state_error(s, TIE_ERR_TOO_MANY_NODES);
-    return NULL;
-  }
-
   size_t size = sizeof(tie_expression);
+
   if (arity > 1) {
     size += (size_t) (arity - 1) * sizeof(tie_expression *);
   }
 
-  tie_expression *ret = (tie_expression *) s->allocator->malloc_fn(size, s->allocator->context);
+  tie_expression *ret = (tie_expression *) allocator->malloc_fn(size, allocator->context);
   if (ret == NULL) {
-    set_state_error(s, TIE_ERR_OUT_OF_MEMORY);
     return NULL;
   }
 
@@ -217,6 +291,21 @@ static tie_expression *new_expr(state *s, const int type) {
   memset(ret, 0, size);
 #endif
   ret->type = type;
+  return ret;
+}
+
+static tie_expression *new_expr(state *s, const int type) {
+  if (s->max_nodes != 0U && s->node_count >= s->max_nodes) {
+    set_state_error(s, TIE_ERR_TOO_MANY_NODES);
+    return NULL;
+  }
+
+  tie_expression *ret = allocate_expr(s->allocator, type);
+  if (ret == NULL) {
+    set_state_error(s, TIE_ERR_OUT_OF_MEMORY);
+    return NULL;
+  }
+
   ++s->node_count;
   return ret;
 }
@@ -888,6 +977,7 @@ static tie_expression *parse_list(state *s) {
   return ret;
 }
 
+#if !TIE_HAS_OVERFLOW_BUILTINS
 static int in_int_range(const intmax_t value) {
   return value >= (intmax_t) INT_MIN && value <= (intmax_t) INT_MAX;
 }
@@ -899,71 +989,55 @@ static int checked_int_result(const intmax_t value, tie_status *status) {
   }
   return (int) value;
 }
+#endif
 
-static int eval_impl(const tie_expression *n, tie_status *status);
-
-static int eval_builtin(const tie_expression *n, tie_status *status) {
-  const tie_operation operation = (tie_operation) n->data.operation;
-
-  if (operation == TIE_OP_IF) {
-    const int condition = eval_impl(n->parameters[0], status);
-    if (*status != TIE_OK) {
-      return 0;
-    }
-    return eval_impl(n->parameters[condition ? 1 : 2], status);
-  }
-
-  if (operation == TIE_OP_COMMA) {
-    (void) eval_impl(n->parameters[0], status);
-    if (*status != TIE_OK) {
-      return 0;
-    }
-    return eval_impl(n->parameters[1], status);
-  }
-
-  if (TYPE_MASK(n->type) == TIE_BUILTIN1) {
-    const int a = eval_impl(n->parameters[0], status);
-    if (*status != TIE_OK) {
-      return 0;
-    }
-
-    switch (operation) {
-      case TIE_OP_NEG:
-        if (a == INT_MIN) {
-          set_eval_error(status, TIE_ERR_OVERFLOW);
-          return 0;
-        }
-        return -a;
-      case TIE_OP_BIT_NOT:
-        return ~a;
-      case TIE_OP_ABS:
-        if (a == INT_MIN) {
-          set_eval_error(status, TIE_ERR_OVERFLOW);
-          return 0;
-        }
-        return a < 0 ? -a : a;
-      default:
-        set_eval_error(status, TIE_ERR_INVALID_ARGUMENT);
-        return 0;
-    }
-  }
-
-  const int a = eval_impl(n->parameters[0], status);
-  if (*status != TIE_OK) {
+TIE_FORCE_INLINE int checked_add(const int a, const int b, tie_status *status) {
+#if TIE_HAS_OVERFLOW_BUILTINS
+  int result = 0;
+  if (__builtin_add_overflow(a, b, &result)) {
+    set_eval_error(status, TIE_ERR_OVERFLOW);
     return 0;
   }
-  const int b = eval_impl(n->parameters[1], status);
-  if (*status != TIE_OK) {
+  return result;
+#else
+  return checked_int_result((intmax_t) a + (intmax_t) b, status);
+#endif
+}
+
+TIE_FORCE_INLINE int checked_sub(const int a, const int b, tie_status *status) {
+#if TIE_HAS_OVERFLOW_BUILTINS
+  int result = 0;
+  if (__builtin_sub_overflow(a, b, &result)) {
+    set_eval_error(status, TIE_ERR_OVERFLOW);
     return 0;
   }
+  return result;
+#else
+  return checked_int_result((intmax_t) a - (intmax_t) b, status);
+#endif
+}
 
+TIE_FORCE_INLINE int checked_mul(const int a, const int b, tie_status *status) {
+#if TIE_HAS_OVERFLOW_BUILTINS
+  int result = 0;
+  if (__builtin_mul_overflow(a, b, &result)) {
+    set_eval_error(status, TIE_ERR_OVERFLOW);
+    return 0;
+  }
+  return result;
+#else
+  return checked_int_result((intmax_t) a * (intmax_t) b, status);
+#endif
+}
+
+TIE_FORCE_INLINE int eval_binary_operation(const tie_operation operation, const int a, const int b, tie_status *status) {
   switch (operation) {
     case TIE_OP_ADD:
-      return checked_int_result((intmax_t) a + (intmax_t) b, status);
+      return checked_add(a, b, status);
     case TIE_OP_SUB:
-      return checked_int_result((intmax_t) a - (intmax_t) b, status);
+      return checked_sub(a, b, status);
     case TIE_OP_MUL:
-      return checked_int_result((intmax_t) a * (intmax_t) b, status);
+      return checked_mul(a, b, status);
     case TIE_OP_DIV:
       if (b == 0) {
         set_eval_error(status, TIE_ERR_DIVIDE_BY_ZERO);
@@ -1006,6 +1080,478 @@ static int eval_builtin(const tie_expression *n, tie_status *status) {
       set_eval_error(status, TIE_ERR_INVALID_ARGUMENT);
       return 0;
   }
+}
+
+TIE_FORCE_INLINE int eval_unary_operation(const tie_operation operation, const int a, tie_status *status) {
+  switch (operation) {
+    case TIE_OP_NEG:
+      if (a == INT_MIN) {
+        set_eval_error(status, TIE_ERR_OVERFLOW);
+        return 0;
+      }
+      return -a;
+    case TIE_OP_BIT_NOT:
+      return ~a;
+    case TIE_OP_ABS:
+      if (a == INT_MIN) {
+        set_eval_error(status, TIE_ERR_OVERFLOW);
+        return 0;
+      }
+      return a < 0 ? -a : a;
+    default:
+      set_eval_error(status, TIE_ERR_INVALID_ARGUMENT);
+      return 0;
+  }
+}
+
+TIE_FORCE_INLINE int checked_shift_amount(const int amount, tie_status *status) {
+  const int width = (int) (sizeof(int) * CHAR_BIT);
+  if (amount < 0 || amount >= width) {
+    set_eval_error(status, TIE_ERR_SHIFT_RANGE);
+    return 0;
+  }
+  return 1;
+}
+
+static int eval_fast_chain(const tie_fast_chain *chain, tie_status *status) {
+  if (chain == NULL || chain->bound == NULL) {
+    set_eval_error(status, TIE_ERR_INVALID_ARGUMENT);
+    return 0;
+  }
+
+  int value = *chain->bound;
+
+  switch (chain->shape) {
+    case TIE_FAST_SHAPE_ADD:
+      return checked_add(value, chain->instructions[0].value, status);
+
+    case TIE_FAST_SHAPE_ADD_ADD:
+      value = checked_add(value, chain->instructions[0].value, status);
+      if (*status != TIE_OK) {
+        return 0;
+      }
+      return checked_add(value, chain->instructions[1].value, status);
+
+    case TIE_FAST_SHAPE_ADD_ABS:
+      value = checked_add(value, chain->instructions[0].value, status);
+      if (*status != TIE_OK) {
+        return 0;
+      }
+      return eval_unary_operation(TIE_OP_ABS, value, status);
+
+    case TIE_FAST_SHAPE_ADD_MUL:
+      value = checked_add(value, chain->instructions[0].value, status);
+      if (*status != TIE_OK) {
+        return 0;
+      }
+      return checked_mul(value, chain->instructions[1].value, status);
+
+    case TIE_FAST_SHAPE_BIT_AND_SHL_XOR:
+      value &= chain->instructions[0].value;
+      value = (int) ((unsigned int) value << chain->instructions[1].value);
+      return value ^ chain->instructions[2].value;
+
+    case TIE_FAST_SHAPE_GENERIC:
+    default:
+      break;
+  }
+
+  for (int i = 0; i < chain->instruction_count; ++i) {
+    const tie_fast_instruction *instruction = chain->instructions + i;
+
+    switch (instruction->type) {
+      case TIE_FAST_NEG:
+        if (value == INT_MIN) {
+          set_eval_error(status, TIE_ERR_OVERFLOW);
+          return 0;
+        }
+        value = -value;
+        break;
+
+      case TIE_FAST_BIT_NOT:
+        value = ~value;
+        break;
+
+      case TIE_FAST_ABS:
+        if (value == INT_MIN) {
+          set_eval_error(status, TIE_ERR_OVERFLOW);
+          return 0;
+        }
+        value = value < 0 ? -value : value;
+        break;
+
+      case TIE_FAST_ADD_RIGHT:
+        value = checked_add(value, instruction->value, status);
+        if (*status != TIE_OK) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_SUB_RIGHT:
+        value = checked_sub(value, instruction->value, status);
+        if (*status != TIE_OK) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_SUB_LEFT:
+        value = checked_sub(instruction->value, value, status);
+        if (*status != TIE_OK) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_MUL_RIGHT:
+        value = checked_mul(value, instruction->value, status);
+        if (*status != TIE_OK) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_DIV_RIGHT:
+        if (instruction->value == 0) {
+          set_eval_error(status, TIE_ERR_DIVIDE_BY_ZERO);
+          return 0;
+        }
+        if (value == INT_MIN && instruction->value == -1) {
+          set_eval_error(status, TIE_ERR_OVERFLOW);
+          return 0;
+        }
+        value /= instruction->value;
+        break;
+
+      case TIE_FAST_DIV_LEFT:
+        if (value == 0) {
+          set_eval_error(status, TIE_ERR_DIVIDE_BY_ZERO);
+          return 0;
+        }
+        if (instruction->value == INT_MIN && value == -1) {
+          set_eval_error(status, TIE_ERR_OVERFLOW);
+          return 0;
+        }
+        value = instruction->value / value;
+        break;
+
+      case TIE_FAST_MOD_RIGHT:
+        if (instruction->value == 0) {
+          set_eval_error(status, TIE_ERR_MODULO_BY_ZERO);
+          return 0;
+        }
+        if (value == INT_MIN && instruction->value == -1) {
+          set_eval_error(status, TIE_ERR_OVERFLOW);
+          return 0;
+        }
+        value %= instruction->value;
+        break;
+
+      case TIE_FAST_MOD_LEFT:
+        if (value == 0) {
+          set_eval_error(status, TIE_ERR_MODULO_BY_ZERO);
+          return 0;
+        }
+        if (instruction->value == INT_MIN && value == -1) {
+          set_eval_error(status, TIE_ERR_OVERFLOW);
+          return 0;
+        }
+        value = instruction->value % value;
+        break;
+
+      case TIE_FAST_BIT_AND_RIGHT:
+        value &= instruction->value;
+        break;
+
+      case TIE_FAST_BIT_OR_RIGHT:
+        value |= instruction->value;
+        break;
+
+      case TIE_FAST_BIT_XOR_RIGHT:
+        value ^= instruction->value;
+        break;
+
+      case TIE_FAST_SHL_RIGHT:
+        if (!checked_shift_amount(instruction->value, status)) {
+          return 0;
+        }
+        value = (int) ((unsigned int) value << instruction->value);
+        break;
+
+      case TIE_FAST_SHL_LEFT:
+        if (!checked_shift_amount(value, status)) {
+          return 0;
+        }
+        value = (int) ((unsigned int) instruction->value << value);
+        break;
+
+      case TIE_FAST_SHR_RIGHT:
+        if (!checked_shift_amount(instruction->value, status)) {
+          return 0;
+        }
+        value = (int) ((unsigned int) value >> instruction->value);
+        break;
+
+      case TIE_FAST_SHR_LEFT:
+        if (!checked_shift_amount(value, status)) {
+          return 0;
+        }
+        value = (int) ((unsigned int) instruction->value >> value);
+        break;
+
+      default:
+        set_eval_error(status, TIE_ERR_INVALID_ARGUMENT);
+        return 0;
+    }
+  }
+
+  return value;
+}
+
+TIE_FORCE_INLINE int checked_add_value(const int a, const int b, int *out) {
+#if TIE_HAS_OVERFLOW_BUILTINS
+  return !__builtin_add_overflow(a, b, out);
+#else
+  const intmax_t value = (intmax_t) a + (intmax_t) b;
+  if (!in_int_range(value)) {
+    return 0;
+  }
+  *out = (int) value;
+  return 1;
+#endif
+}
+
+TIE_FORCE_INLINE int checked_sub_value(const int a, const int b, int *out) {
+#if TIE_HAS_OVERFLOW_BUILTINS
+  return !__builtin_sub_overflow(a, b, out);
+#else
+  const intmax_t value = (intmax_t) a - (intmax_t) b;
+  if (!in_int_range(value)) {
+    return 0;
+  }
+  *out = (int) value;
+  return 1;
+#endif
+}
+
+TIE_FORCE_INLINE int checked_mul_value(const int a, const int b, int *out) {
+#if TIE_HAS_OVERFLOW_BUILTINS
+  return !__builtin_mul_overflow(a, b, out);
+#else
+  const intmax_t value = (intmax_t) a * (intmax_t) b;
+  if (!in_int_range(value)) {
+    return 0;
+  }
+  *out = (int) value;
+  return 1;
+#endif
+}
+
+static int eval_fast_chain_or_zero(const tie_fast_chain *chain) {
+  if (chain == NULL || chain->bound == NULL) {
+    return 0;
+  }
+
+  int value = *chain->bound;
+
+  switch (chain->shape) {
+    case TIE_FAST_SHAPE_ADD:
+      return checked_add_value(value, chain->instructions[0].value, &value) ? value : 0;
+
+    case TIE_FAST_SHAPE_ADD_ADD:
+      if (!checked_add_value(value, chain->instructions[0].value, &value) ||
+          !checked_add_value(value, chain->instructions[1].value, &value)) {
+        return 0;
+      }
+      return value;
+
+    case TIE_FAST_SHAPE_ADD_ABS:
+      if (!checked_add_value(value, chain->instructions[0].value, &value) || value == INT_MIN) {
+        return 0;
+      }
+      return value < 0 ? -value : value;
+
+    case TIE_FAST_SHAPE_ADD_MUL:
+      if (!checked_add_value(value, chain->instructions[0].value, &value) ||
+          !checked_mul_value(value, chain->instructions[1].value, &value)) {
+        return 0;
+      }
+      return value;
+
+    case TIE_FAST_SHAPE_BIT_AND_SHL_XOR:
+      value &= chain->instructions[0].value;
+      value = (int) ((unsigned int) value << chain->instructions[1].value);
+      return value ^ chain->instructions[2].value;
+
+    case TIE_FAST_SHAPE_GENERIC:
+    default:
+      break;
+  }
+
+  for (int i = 0; i < chain->instruction_count; ++i) {
+    const tie_fast_instruction *instruction = chain->instructions + i;
+
+    switch (instruction->type) {
+      case TIE_FAST_NEG:
+        if (value == INT_MIN) {
+          return 0;
+        }
+        value = -value;
+        break;
+
+      case TIE_FAST_BIT_NOT:
+        value = ~value;
+        break;
+
+      case TIE_FAST_ABS:
+        if (value == INT_MIN) {
+          return 0;
+        }
+        value = value < 0 ? -value : value;
+        break;
+
+      case TIE_FAST_ADD_RIGHT:
+        if (!checked_add_value(value, instruction->value, &value)) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_SUB_RIGHT:
+        if (!checked_sub_value(value, instruction->value, &value)) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_SUB_LEFT:
+        if (!checked_sub_value(instruction->value, value, &value)) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_MUL_RIGHT:
+        if (!checked_mul_value(value, instruction->value, &value)) {
+          return 0;
+        }
+        break;
+
+      case TIE_FAST_DIV_RIGHT:
+        if (instruction->value == 0 || (value == INT_MIN && instruction->value == -1)) {
+          return 0;
+        }
+        value /= instruction->value;
+        break;
+
+      case TIE_FAST_DIV_LEFT:
+        if (value == 0 || (instruction->value == INT_MIN && value == -1)) {
+          return 0;
+        }
+        value = instruction->value / value;
+        break;
+
+      case TIE_FAST_MOD_RIGHT:
+        if (instruction->value == 0 || (value == INT_MIN && instruction->value == -1)) {
+          return 0;
+        }
+        value %= instruction->value;
+        break;
+
+      case TIE_FAST_MOD_LEFT:
+        if (value == 0 || (instruction->value == INT_MIN && value == -1)) {
+          return 0;
+        }
+        value = instruction->value % value;
+        break;
+
+      case TIE_FAST_BIT_AND_RIGHT:
+        value &= instruction->value;
+        break;
+
+      case TIE_FAST_BIT_OR_RIGHT:
+        value |= instruction->value;
+        break;
+
+      case TIE_FAST_BIT_XOR_RIGHT:
+        value ^= instruction->value;
+        break;
+
+      case TIE_FAST_SHL_RIGHT:
+        value = (int) ((unsigned int) value << instruction->value);
+        break;
+
+      case TIE_FAST_SHL_LEFT:
+        if (value < 0 || value >= (int) (sizeof(int) * CHAR_BIT)) {
+          return 0;
+        }
+        value = (int) ((unsigned int) instruction->value << value);
+        break;
+
+      case TIE_FAST_SHR_RIGHT:
+        value = (int) ((unsigned int) value >> instruction->value);
+        break;
+
+      case TIE_FAST_SHR_LEFT:
+        if (value < 0 || value >= (int) (sizeof(int) * CHAR_BIT)) {
+          return 0;
+        }
+        value = (int) ((unsigned int) instruction->value >> value);
+        break;
+
+      default:
+        return 0;
+    }
+  }
+
+  return value;
+}
+
+static int eval_impl(const tie_expression *n, tie_status *status);
+
+TIE_NOINLINE int eval_builtin(const tie_expression *n, tie_status *status) {
+  const tie_operation operation = node_operation(n);
+
+  if (HAS_INLINE_CONSTANT(n->type)) {
+    const int value = eval_impl(n->parameters[0], status);
+    if (*status != TIE_OK) {
+      return 0;
+    }
+    if (INLINE_CONSTANT_LEFT(n->type)) {
+      return eval_binary_operation(operation, n->data.value, value, status);
+    }
+    return eval_binary_operation(operation, value, n->data.value, status);
+  }
+
+  if (operation == TIE_OP_IF) {
+    const int condition = eval_impl(n->parameters[0], status);
+    if (*status != TIE_OK) {
+      return 0;
+    }
+    return eval_impl(n->parameters[condition ? 1 : 2], status);
+  }
+
+  if (operation == TIE_OP_COMMA) {
+    (void) eval_impl(n->parameters[0], status);
+    if (*status != TIE_OK) {
+      return 0;
+    }
+    return eval_impl(n->parameters[1], status);
+  }
+
+  if (TYPE_MASK(n->type) == TIE_BUILTIN1) {
+    const int a = eval_impl(n->parameters[0], status);
+    if (*status != TIE_OK) {
+      return 0;
+    }
+
+    return eval_unary_operation(operation, a, status);
+  }
+
+  const int a = eval_impl(n->parameters[0], status);
+  if (*status != TIE_OK) {
+    return 0;
+  }
+  const int b = eval_impl(n->parameters[1], status);
+  if (*status != TIE_OK) {
+    return 0;
+  }
+
+  return eval_binary_operation(operation, a, b, status);
 }
 
 static int eval_function(const tie_expression *n, tie_status *status) {
@@ -1138,9 +1684,23 @@ static int eval_impl(const tie_expression *n, tie_status *status) {
       }
       return *n->data.bound;
     case TIE_BUILTIN1:
+      if (HAS_INLINE_CONSTANT(n->type)) {
+        const tie_operation operation = node_operation(n);
+        const int value = eval_impl(n->parameters[0], status);
+        if (*status != TIE_OK) {
+          return 0;
+        }
+        if (INLINE_CONSTANT_LEFT(n->type)) {
+          return eval_binary_operation(operation, n->data.value, value, status);
+        }
+        return eval_binary_operation(operation, value, n->data.value, status);
+      }
+      return eval_builtin(n, status);
     case TIE_BUILTIN2:
     case TIE_BUILTIN3:
       return eval_builtin(n, status);
+    case TIE_FAST_CHAIN:
+      return eval_fast_chain((const tie_fast_chain *) n->context, status);
     case TIE_FUNCTION0:
     case TIE_FUNCTION1:
     case TIE_FUNCTION2:
@@ -1165,8 +1725,18 @@ static int eval_impl(const tie_expression *n, tie_status *status) {
 }
 
 int tie_eval_status(const tie_expression *n, tie_status *status) {
+  if (status == NULL && n != NULL && TYPE_MASK(n->type) == TIE_FAST_CHAIN) {
+    return eval_fast_chain_or_zero((const tie_fast_chain *) n->context);
+  }
+
   tie_status local_status = TIE_OK;
-  int ret = eval_impl(n, &local_status);
+  int ret = 0;
+
+  if (n != NULL && TYPE_MASK(n->type) == TIE_FAST_CHAIN) {
+    ret = eval_fast_chain((const tie_fast_chain *) n->context, &local_status);
+  } else {
+    ret = eval_impl(n, &local_status);
+  }
 
   if (status != NULL) {
     *status = local_status;
@@ -1175,11 +1745,52 @@ int tie_eval_status(const tie_expression *n, tie_status *status) {
 }
 
 int tie_eval(const tie_expression *n) {
-  return tie_eval_status(n, NULL);
+  if (n != NULL && TYPE_MASK(n->type) == TIE_FAST_CHAIN) {
+    return eval_fast_chain_or_zero((const tie_fast_chain *) n->context);
+  }
+
+  tie_status status = TIE_OK;
+  int ret = 0;
+
+  ret = eval_impl(n, &status);
+  return status == TIE_OK ? ret : 0;
 }
 
 static int is_constant(const tie_expression *n) {
   return n != NULL && TYPE_MASK(n->type) == TIE_CONSTANT;
+}
+
+static int can_inline_constant_operand(const tie_operation operation) {
+  switch (operation) {
+    case TIE_OP_ADD:
+    case TIE_OP_SUB:
+    case TIE_OP_MUL:
+    case TIE_OP_DIV:
+    case TIE_OP_MOD:
+    case TIE_OP_BIT_AND:
+    case TIE_OP_BIT_OR:
+    case TIE_OP_BIT_XOR:
+    case TIE_OP_SHL:
+    case TIE_OP_SHR:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+static void inline_constant_operand(tie_expression *n, const tie_operation operation,
+                                    const int constant_on_left, tie_expression *expr,
+                                    tie_expression *constant, const tie_allocator *allocator) {
+  const int value = constant->data.value;
+
+  release_node(constant, allocator);
+  n->type = TIE_BUILTIN1 | TIE_FLAG_PURE |
+            (constant_on_left ? TIE_CONST_LEFT : TIE_CONST_RIGHT) |
+            ENCODE_OPERATION(operation);
+  n->data.value = value;
+  n->context = NULL;
+  n->parameters[0] = expr;
+  n->parameters[1] = NULL;
 }
 
 static void optimize(tie_expression *n, const tie_allocator *allocator) {
@@ -1206,7 +1817,222 @@ static void optimize(tie_expression *n, const tie_allocator *allocator) {
       n->data.value = value;
       n->context = NULL;
     }
+    return;
   }
+
+  if (TYPE_MASK(n->type) == TIE_BUILTIN2 && IS_PURE(n->type)) {
+    const tie_operation operation = node_operation(n);
+    if (can_inline_constant_operand(operation)) {
+      if (is_constant(n->parameters[1])) {
+        inline_constant_operand(n, operation, 0, n->parameters[0], n->parameters[1], allocator);
+      } else if (is_constant(n->parameters[0])) {
+        inline_constant_operand(n, operation, 1, n->parameters[1], n->parameters[0], allocator);
+      }
+    }
+  }
+}
+
+static int can_compile_unary_operation(const tie_operation operation) {
+  return operation == TIE_OP_NEG || operation == TIE_OP_BIT_NOT || operation == TIE_OP_ABS;
+}
+
+static tie_fast_instruction_type fast_unary_type(const tie_operation operation) {
+  switch (operation) {
+    case TIE_OP_NEG:
+      return TIE_FAST_NEG;
+    case TIE_OP_BIT_NOT:
+      return TIE_FAST_BIT_NOT;
+    case TIE_OP_ABS:
+      return TIE_FAST_ABS;
+    default:
+      return TIE_FAST_NEG;
+  }
+}
+
+static tie_fast_instruction_type fast_binary_type(const tie_operation operation, const int constant_on_left) {
+  switch (operation) {
+    case TIE_OP_ADD:
+      return TIE_FAST_ADD_RIGHT;
+    case TIE_OP_SUB:
+      return constant_on_left ? TIE_FAST_SUB_LEFT : TIE_FAST_SUB_RIGHT;
+    case TIE_OP_MUL:
+      return TIE_FAST_MUL_RIGHT;
+    case TIE_OP_DIV:
+      return constant_on_left ? TIE_FAST_DIV_LEFT : TIE_FAST_DIV_RIGHT;
+    case TIE_OP_MOD:
+      return constant_on_left ? TIE_FAST_MOD_LEFT : TIE_FAST_MOD_RIGHT;
+    case TIE_OP_BIT_AND:
+      return TIE_FAST_BIT_AND_RIGHT;
+    case TIE_OP_BIT_OR:
+      return TIE_FAST_BIT_OR_RIGHT;
+    case TIE_OP_BIT_XOR:
+      return TIE_FAST_BIT_XOR_RIGHT;
+    case TIE_OP_SHL:
+      return constant_on_left ? TIE_FAST_SHL_LEFT : TIE_FAST_SHL_RIGHT;
+    case TIE_OP_SHR:
+      return constant_on_left ? TIE_FAST_SHR_LEFT : TIE_FAST_SHR_RIGHT;
+    default:
+      return TIE_FAST_ADD_RIGHT;
+  }
+}
+
+static int measure_fast_chain_node(const tie_expression *n, const volatile int **bound,
+                                   int *instruction_count) {
+  if (n == NULL || *instruction_count >= TIE_FAST_CHAIN_LIMIT) {
+    return 0;
+  }
+
+  switch (TYPE_MASK(n->type)) {
+    case TIE_VARIABLE:
+      if (n->data.bound == NULL) {
+        return 0;
+      }
+      if (*bound != NULL && *bound != n->data.bound) {
+        return 0;
+      }
+      *bound = n->data.bound;
+      return 1;
+
+    case TIE_BUILTIN1:
+      if (HAS_INLINE_CONSTANT(n->type)) {
+        const tie_operation operation = node_operation(n);
+        if (!INLINE_CONSTANT_LEFT(n->type) &&
+            (operation == TIE_OP_SHL || operation == TIE_OP_SHR)) {
+          const int amount = n->data.value;
+          const int width = (int) (sizeof(int) * CHAR_BIT);
+          if (amount < 0 || amount >= width) {
+            return 0;
+          }
+        }
+        if (!measure_fast_chain_node(n->parameters[0], bound, instruction_count)) {
+          return 0;
+        }
+        ++*instruction_count;
+        return 1;
+      }
+      if (!can_compile_unary_operation(node_operation(n))) {
+        return 0;
+      }
+      if (!measure_fast_chain_node(n->parameters[0], bound, instruction_count)) {
+        return 0;
+      }
+      ++*instruction_count;
+      return 1;
+
+    default:
+      return 0;
+  }
+}
+
+static tie_fast_instruction *emit_fast_instruction(tie_fast_chain *chain, int *index,
+                                                  const tie_fast_instruction_type type) {
+  tie_fast_instruction *instruction = chain->instructions + *index;
+  ++*index;
+  instruction->type = type;
+  instruction->value = 0;
+  return instruction;
+}
+
+static void emit_fast_chain_node(const tie_expression *n, tie_fast_chain *chain, int *index) {
+  tie_fast_instruction *instruction = NULL;
+
+  switch (TYPE_MASK(n->type)) {
+    case TIE_VARIABLE:
+      return;
+
+    case TIE_BUILTIN1:
+      emit_fast_chain_node(n->parameters[0], chain, index);
+      if (HAS_INLINE_CONSTANT(n->type)) {
+        instruction = emit_fast_instruction(chain, index,
+                                            fast_binary_type(node_operation(n), INLINE_CONSTANT_LEFT(n->type)));
+        instruction->value = n->data.value;
+        return;
+      }
+      (void) emit_fast_instruction(chain, index, fast_unary_type(node_operation(n)));
+      return;
+
+    default:
+      return;
+  }
+}
+
+static tie_fast_chain_shape detect_fast_chain_shape(const tie_fast_chain *chain) {
+  const tie_fast_instruction *instructions = chain->instructions;
+
+  if (chain->instruction_count == 1 &&
+      instructions[0].type == TIE_FAST_ADD_RIGHT) {
+    return TIE_FAST_SHAPE_ADD;
+  }
+
+  if (chain->instruction_count == 2 &&
+      instructions[0].type == TIE_FAST_ADD_RIGHT) {
+    if (instructions[1].type == TIE_FAST_ADD_RIGHT) {
+      return TIE_FAST_SHAPE_ADD_ADD;
+    }
+    if (instructions[1].type == TIE_FAST_ABS) {
+      return TIE_FAST_SHAPE_ADD_ABS;
+    }
+    if (instructions[1].type == TIE_FAST_MUL_RIGHT) {
+      return TIE_FAST_SHAPE_ADD_MUL;
+    }
+  }
+
+  if (chain->instruction_count == 3 &&
+      instructions[0].type == TIE_FAST_BIT_AND_RIGHT &&
+      instructions[1].type == TIE_FAST_SHL_RIGHT &&
+      instructions[2].type == TIE_FAST_BIT_XOR_RIGHT) {
+    return TIE_FAST_SHAPE_BIT_AND_SHL_XOR;
+  }
+
+  return TIE_FAST_SHAPE_GENERIC;
+}
+
+static tie_expression *make_fast_chain_expression(state *s, tie_expression *root) {
+  const volatile int *bound = NULL;
+  int instruction_count = 0;
+
+  if (!measure_fast_chain_node(root, &bound, &instruction_count) ||
+      bound == NULL || instruction_count <= 0) {
+    return NULL;
+  }
+  if (s->max_nodes != 0U && s->node_count >= s->max_nodes) {
+    return NULL;
+  }
+
+  size_t size = sizeof(tie_fast_chain);
+  if (instruction_count > 1) {
+    size += (size_t) (instruction_count - 1) * sizeof(tie_fast_instruction);
+  }
+
+  tie_fast_chain *chain = (tie_fast_chain *) s->allocator->malloc_fn(size, s->allocator->context);
+  if (chain == NULL) {
+    return NULL;
+  }
+  chain->bound = bound;
+  chain->instruction_count = instruction_count;
+  chain->shape = TIE_FAST_SHAPE_GENERIC;
+
+  int index = 0;
+  emit_fast_chain_node(root, chain, &index);
+  if (index != instruction_count) {
+    if (s->allocator->free_fn != NULL) {
+      s->allocator->free_fn(chain, s->allocator->context);
+    }
+    return NULL;
+  }
+  chain->shape = detect_fast_chain_shape(chain);
+
+  tie_expression *chain_expr = allocate_expr(s->allocator, TIE_FAST_CHAIN);
+  if (chain_expr == NULL) {
+    if (s->allocator->free_fn != NULL) {
+      s->allocator->free_fn(chain, s->allocator->context);
+    }
+    return NULL;
+  }
+  chain_expr->context = chain;
+  chain_expr->parameters[0] = root;
+  ++s->node_count;
+  return chain_expr;
 }
 
 static int error_position(const state *s) {
@@ -1282,6 +2108,10 @@ tie_expression *tie_compile_ex(const char *expression, const tie_variable *varia
   }
 
   optimize(root, s.allocator);
+  tie_expression *chain = make_fast_chain_expression(&s, root);
+  if (chain != NULL) {
+    root = chain;
+  }
   if (status != NULL) {
     *status = TIE_OK;
   }
@@ -1401,8 +2231,11 @@ static void print_node(const tie_expression *n, int depth) {
     case TIE_BUILTIN1:
     case TIE_BUILTIN2:
     case TIE_BUILTIN3:
-      printf("%s\n", operation_name((tie_operation) n->data.operation));
+      printf("%s\n", operation_name(node_operation(n)));
       break;
+    case TIE_FAST_CHAIN:
+      print_node(n->parameters[0], depth);
+      return;
     case TIE_FUNCTION0:
     case TIE_FUNCTION1:
     case TIE_FUNCTION2:

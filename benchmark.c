@@ -5,8 +5,24 @@
 #include <time.h>
 
 #define loops 10000
+#define eval_count ((long long) loops * (long long) loops)
 
 typedef int (*function1)(int);
+
+static void print_timing(const char *label, long long total, clock_t ticks) {
+  printf("%-6s %lld", label, total);
+
+  if (ticks > 0) {
+    const double seconds = (double) ticks / (double) CLOCKS_PER_SEC;
+    const double ns_per_eval = seconds * 1000000000.0 / (double) eval_count;
+    const double mops = (double) eval_count / seconds / 1000000.0;
+    const double ms = seconds * 1000.0;
+
+    printf("\t%8.3f ns/eval\t%8.1f mops\t%8.1f ms\n", ns_per_eval, mops, ms);
+  } else {
+    printf("\t< clock resolution\tinf mops\t0.0 ms\n");
+  }
+}
 
 static void bench(const char *expr, function1 func) {
   int i;
@@ -21,7 +37,6 @@ static void bench(const char *expr, function1 func) {
 
   printf("Expression: %s\n", expr);
 
-  printf("native ");
   start = clock();
   total = 0;
   for (j = 0; j < loops; ++j) {
@@ -30,16 +45,9 @@ static void bench(const char *expr, function1 func) {
       total += func(tmp);
     }
   }
-  const int nelapsed = (int) ((clock() - start) * 1000 / CLOCKS_PER_SEC);
+  const clock_t nticks = clock() - start;
+  print_timing("native", total, nticks);
 
-  printf(" %lld", total);
-  if (nelapsed) {
-    printf("\t%5dms\t%5dmops\n", nelapsed, loops * loops / nelapsed / 1000);
-  } else {
-    printf("\tinf\n");
-  }
-
-  printf("interp ");
   int err = 0;
   tie_status status = TIE_OK;
   tie_expression *n = tie_compile_ex(expr, vars, 1, &err, &status, NULL);
@@ -56,18 +64,12 @@ static void bench(const char *expr, function1 func) {
       total += tie_eval(n);
     }
   }
-  const int eelapsed = (int) ((clock() - start) * 1000 / CLOCKS_PER_SEC);
+  const clock_t eticks = clock() - start;
   tie_free(n);
+  print_timing("interp", total, eticks);
 
-  printf(" %lld", total);
-  if (eelapsed) {
-    printf("\t%5dms\t%5dmops\n", eelapsed, loops * loops / eelapsed / 1000);
-  } else {
-    printf("\tinf\n");
-  }
-
-  if (nelapsed) {
-    printf("%.2f%% longer\n", (((double) eelapsed / nelapsed) - 1.0) * 100.0);
+  if (nticks > 0) {
+    printf("%.2f%% longer\n", (((double) eticks / (double) nticks) - 1.0) * 100.0);
   }
   printf("\n");
 }
@@ -97,6 +99,9 @@ static int bitmix(int a) {
 }
 
 int main(void) {
+  printf("Each timing line runs %lld evaluations; ns/eval is total CPU time divided by that count.\n\n",
+         eval_count);
+
   bench("a+5", a5);
   bench("5+a+5", a55);
   bench("abs(a+5)", a5abs);
